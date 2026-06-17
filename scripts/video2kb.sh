@@ -3,7 +3,10 @@
 # video2kb - Download, transcribe, and convert video tutorials into
 #            structured markdown notes for a personal knowledge base.
 #
-# Dependencies: yt-dlp, ffmpeg, whisper.cpp
+# Strategy: subtitle-first — grab existing captions before falling
+#           back to expensive audio transcription.
+#
+# Dependencies: yt-dlp, ffmpeg, whisper.cpp (or SenseVoice for Chinese)
 # Usage: video2kb.sh <url> [options]
 #
 set -euo pipefail
@@ -20,11 +23,11 @@ MODEL=""
 KEEP_VIDEO=false
 KEEP_AUDIO=false
 THREADS=$(nproc 2>/dev/null || echo 4)
-FORMAT="markdown"
+GEN_SRT=false
 
 usage() {
   cat <<'USAGE'
-video2kb - Video tutorial to knowledge base
+video2kb - Video tutorial to knowledge base (subtitle-first strategy)
 
 USAGE:
   video2kb.sh <url> [options]
@@ -38,11 +41,13 @@ OPTIONS:
   --keep-video           Keep the downloaded video file
   --keep-audio           Keep the extracted audio file
   --srt                  Also generate SRT subtitle file
+  --no-subs              Skip subtitle fetch, force audio transcription
   -h, --help             Show this help
 
 EXAMPLES:
   video2kb.sh "https://www.youtube.com/watch?v=dQw4w9WgXcQ"
   video2kb.sh "https://www.bilibili.com/video/BV1xx411c7mD" -l zh
+  video2kb.sh "https://v.douyin.com/xxx" -l zh
   video2kb.sh "https://youtu.be/abc123" -l en --keep-video --srt
 USAGE
   exit 0
@@ -52,7 +57,7 @@ USAGE
 [ $# -eq 0 ] && usage
 URL="$1"; shift
 
-GEN_SRT=false
+SKIP_SUBS=false
 
 while [ $# -gt 0 ]; do
   case "$1" in
@@ -63,6 +68,7 @@ while [ $# -gt 0 ]; do
     --keep-video) KEEP_VIDEO=true; shift ;;
     --keep-audio) KEEP_AUDIO=true; shift ;;
     --srt)        GEN_SRT=true; shift ;;
+    --no-subs)    SKIP_SUBS=true; shift ;;
     -h|--help)    usage ;;
     *) echo "Unknown option: $1"; usage ;;
   esac
@@ -71,22 +77,13 @@ done
 [ -n "$MODEL" ] && MODEL_PATH="$MODEL"
 
 # ---------- preflight checks ----------
-for cmd in yt-dlp ffmpeg; do
-  if ! command -v "$cmd" &>/dev/null; then
-    echo "[ERROR] $cmd not found. Run: ./scripts/setup.sh"
-    exit 1
-  fi
-done
-
-if [ ! -f "$WHISPER_BIN" ]; then
-  echo "[ERROR] whisper-cli not found at $WHISPER_BIN"
-  echo "        Run: ./scripts/setup.sh"
+if ! command -v yt-dlp &>/dev/null; then
+  echo "[ERROR] yt-dlp not found. Run: ./scripts/setup.sh"
   exit 1
 fi
 
-if [ ! -f "$MODEL_PATH" ]; then
-  echo "[ERROR] Whisper model not found at $MODEL_PATH"
-  echo "        Run: ./scripts/setup.sh"
+if ! command -v ffmpeg &>/dev/null; then
+  echo "[ERROR] ffmpeg not found. Run: ./scripts/setup.sh"
   exit 1
 fi
 
@@ -96,12 +93,104 @@ mkdir -p "$OUTPUT_DIR"
 WORK_DIR=$(mktemp -d)
 trap 'rm -rf "$WORK_DIR"' EXIT
 
+# ---------- detect platform ----------
+detect_platform() {
+  case "$1" in
+    *douyin.com*|*iesdouyin.com*)  echo "douyin" ;;
+    *bilibili.com*|*b23.tv*)      echo "bilibili" ;;
+    *youtube.com*|*youtu.be*)      echo "youtube" ;;
+    *xiaohongshu.com*|*xhslink.*) echo "xiaohongshu" ;;
+    *weibo.com*|*weibo.cn*)        echo "weibo" ;;
+    *x.com*|*twitter.com*)         echo "x" ;;
+    *)                             echo "generic" ;;
+  esac
+}
+
+PLATFORM=$(detect_platform "$URL")
+echo ""
+echo "=========================================="
+echo " Platform: $PLATFORM"
+echo "=========================================="
+
 # ============================================================
-# STEP 1: Download video and extract metadata
+# STEP 1: Try subtitle-first strategy
+# ============================================================
+TRANSCRIPT_FILE=""
+SUBTITLE_SOURCE=""
+
+if [ "$SKIP_SUBS" = false ]; then
+  echo ""
+  echo "=========================================="
+  echo " STEP 1/4  Trying subtitle-first strategy..."
+  echo "=========================================="
+
+  # Try fetching existing subtitles via yt-dlp
+  SUB_LANG="$LANG"
+  [ "$SUB_LANG" = "auto" ] && SUB_LANG="zh,en,ja,ko"
+
+  yt-dlp \
+    --no-playlist \
+    --skip-download \
+    --write-subs \
+    --write-auto-subs \
+    --sub-langs "$SUB_LANG" \
+    --sub-format "srt/vtt/best" \
+    --convert-subs srt \
+    --output "$WORK_DIR/subs" \
+    "$URL" 2>/dev/null || true
+
+  # Check if any subtitle files were downloaded
+  SUB_FILE=$(ls "$WORK_DIR"/subs*.srt 2>/dev/null | head -1)
+
+  if [ -n "$SUB_FILE" ] && [ -s "$SUB_FILE" ]; then
+    echo "[OK] Found existing subtitles!"
+    SUBTITLE_SOURCE="platform-subtitles"
+
+    # Parse SRT: strip timestamps, sequence numbers, HTML tags, deduplicate
+    python3 -c "
+import re, sys
+
+with open('$SUB_FILE', 'r', encoding='utf-8', errors='ignore') as f:
+    content = f.read()
+
+# Remove sequence numbers and timestamps
+lines = []
+for line in content.split('\n'):
+    line = line.strip()
+    if not line:
+        continue
+    if re.match(r'^\d+$', line):
+        continue
+    if re.match(r'\d{2}:\d{2}:\d{2}', line):
+        continue
+    # Remove HTML tags
+    line = re.sub(r'<[^>]+>', '', line)
+    # Remove VTT positioning
+    line = re.sub(r'align:.*|position:.*|size:.*', '', line).strip()
+    if line and line not in lines[-1:]:
+        lines.append(line)
+
+print('\n'.join(lines))
+" > "$WORK_DIR/transcript_raw.txt"
+
+    WORD_COUNT=$(wc -c < "$WORK_DIR/transcript_raw.txt")
+    if [ "$WORD_COUNT" -gt 50 ]; then
+      TRANSCRIPT_FILE="$WORK_DIR/transcript_raw.txt"
+      echo "[OK] Subtitle transcript: $(wc -w < "$TRANSCRIPT_FILE") words"
+    else
+      echo "[WARN] Subtitle content too short, will try audio transcription"
+    fi
+  else
+    echo "[INFO] No subtitles available, will use audio transcription"
+  fi
+fi
+
+# ============================================================
+# STEP 2: Download video (needed for metadata + audio fallback)
 # ============================================================
 echo ""
 echo "=========================================="
-echo " STEP 1/4  Downloading video..."
+echo " STEP 2/4  Downloading video..."
 echo "=========================================="
 
 yt-dlp \
@@ -120,7 +209,7 @@ if [ -z "$VIDEO_FILE" ]; then
   exit 1
 fi
 
-# extract metadata from info json
+# extract metadata
 TITLE=""
 CHANNEL=""
 UPLOAD_DATE=""
@@ -129,12 +218,12 @@ DURATION=""
 VIDEO_URL=""
 
 if [ -n "$INFO_JSON" ] && [ -f "$INFO_JSON" ]; then
-  TITLE=$(python3 -c "import json,sys; d=json.load(open('$INFO_JSON')); print(d.get('title',''))" 2>/dev/null || true)
-  CHANNEL=$(python3 -c "import json,sys; d=json.load(open('$INFO_JSON')); print(d.get('channel','') or d.get('uploader',''))" 2>/dev/null || true)
-  UPLOAD_DATE=$(python3 -c "import json,sys; d=json.load(open('$INFO_JSON')); print(d.get('upload_date',''))" 2>/dev/null || true)
-  DESCRIPTION=$(python3 -c "import json,sys; d=json.load(open('$INFO_JSON')); print(d.get('description','')[:500])" 2>/dev/null || true)
-  DURATION=$(python3 -c "import json,sys; d=json.load(open('$INFO_JSON')); s=int(d.get('duration',0)); print(f'{s//3600}h{(s%3600)//60:02d}m{s%60:02d}s' if s>3600 else f'{s//60}m{s%60:02d}s')" 2>/dev/null || true)
-  VIDEO_URL=$(python3 -c "import json,sys; d=json.load(open('$INFO_JSON')); print(d.get('webpage_url','') or d.get('original_url',''))" 2>/dev/null || true)
+  TITLE=$(python3 -c "import json; d=json.load(open('$INFO_JSON')); print(d.get('title',''))" 2>/dev/null || true)
+  CHANNEL=$(python3 -c "import json; d=json.load(open('$INFO_JSON')); print(d.get('channel','') or d.get('uploader',''))" 2>/dev/null || true)
+  UPLOAD_DATE=$(python3 -c "import json; d=json.load(open('$INFO_JSON')); print(d.get('upload_date',''))" 2>/dev/null || true)
+  DESCRIPTION=$(python3 -c "import json; d=json.load(open('$INFO_JSON')); print(d.get('description','')[:500])" 2>/dev/null || true)
+  DURATION=$(python3 -c "import json; d=json.load(open('$INFO_JSON')); s=int(d.get('duration',0)); print(f'{s//3600}h{(s%3600)//60:02d}m{s%60:02d}s' if s>3600 else f'{s//60}m{s%60:02d}s')" 2>/dev/null || true)
+  VIDEO_URL=$(python3 -c "import json; d=json.load(open('$INFO_JSON')); print(d.get('webpage_url','') or d.get('original_url',''))" 2>/dev/null || true)
 fi
 
 [ -z "$TITLE" ] && TITLE="Untitled Video"
@@ -148,58 +237,74 @@ echo "[OK] Channel: $CHANNEL"
 echo "[OK] Duration: $DURATION"
 
 # ============================================================
-# STEP 2: Extract audio (16kHz mono WAV for whisper.cpp)
+# STEP 3: Audio transcription (only if subtitles not found)
 # ============================================================
-echo ""
-echo "=========================================="
-echo " STEP 2/4  Extracting audio..."
-echo "=========================================="
+if [ -z "$TRANSCRIPT_FILE" ]; then
+  echo ""
+  echo "=========================================="
+  echo " STEP 3/4  Audio transcription fallback..."
+  echo "=========================================="
 
-AUDIO_WAV="$WORK_DIR/audio.wav"
+  # Check whisper availability
+  if [ ! -f "$WHISPER_BIN" ]; then
+    echo "[ERROR] whisper-cli not found at $WHISPER_BIN"
+    echo "        Run: ./scripts/setup.sh"
+    exit 1
+  fi
 
-ffmpeg -y -i "$VIDEO_FILE" \
-  -ar 16000 -ac 1 -c:a pcm_s16le \
-  -loglevel warning \
-  "$AUDIO_WAV"
+  if [ ! -f "$MODEL_PATH" ]; then
+    echo "[ERROR] Whisper model not found at $MODEL_PATH"
+    echo "        Run: ./scripts/setup.sh"
+    exit 1
+  fi
 
-AUDIO_SIZE=$(du -h "$AUDIO_WAV" | cut -f1)
-echo "[OK] Audio extracted: $AUDIO_SIZE (16kHz mono WAV)"
+  AUDIO_WAV="$WORK_DIR/audio.wav"
+  ffmpeg -y -i "$VIDEO_FILE" \
+    -ar 16000 -ac 1 -c:a pcm_s16le \
+    -loglevel warning \
+    "$AUDIO_WAV"
 
-# ============================================================
-# STEP 3: Transcribe with whisper.cpp
-# ============================================================
-echo ""
-echo "=========================================="
-echo " STEP 3/4  Transcribing with whisper.cpp..."
-echo "=========================================="
+  AUDIO_SIZE=$(du -h "$AUDIO_WAV" | cut -f1)
+  echo "[OK] Audio extracted: $AUDIO_SIZE (16kHz mono WAV)"
 
-WHISPER_ARGS=(
-  -m "$MODEL_PATH"
-  -f "$AUDIO_WAV"
-  -t "$THREADS"
-  -pp          # print progress
-  -otxt        # output .txt
-)
+  WHISPER_ARGS=(
+    -m "$MODEL_PATH"
+    -f "$AUDIO_WAV"
+    -t "$THREADS"
+    -pp
+    -otxt
+  )
 
-if [ "$LANG" != "auto" ]; then
-  WHISPER_ARGS+=(-l "$LANG")
+  if [ "$LANG" != "auto" ]; then
+    WHISPER_ARGS+=(-l "$LANG")
+  fi
+
+  if [ "$GEN_SRT" = true ]; then
+    WHISPER_ARGS+=(-osrt)
+  fi
+
+  "$WHISPER_BIN" "${WHISPER_ARGS[@]}" -of "$WORK_DIR/transcript"
+
+  TRANSCRIPT_FILE="$WORK_DIR/transcript.txt"
+  SUBTITLE_SOURCE="whisper-transcription"
+
+  if [ ! -f "$TRANSCRIPT_FILE" ]; then
+    echo "[ERROR] Transcription failed."
+    exit 1
+  fi
+
+  echo "[OK] Transcription complete: ~$(wc -w < "$TRANSCRIPT_FILE") words"
+
+  if [ "$KEEP_AUDIO" = true ]; then
+    cp "$AUDIO_WAV" "$OUTPUT_DIR/${TIMESTAMP}_${SAFE_TITLE}.wav"
+    echo "[OK] Audio kept in output/"
+  fi
+else
+  echo ""
+  echo "=========================================="
+  echo " STEP 3/4  Skipped (subtitles found)"
+  echo "=========================================="
 fi
-
-if [ "$GEN_SRT" = true ]; then
-  WHISPER_ARGS+=(-osrt)
-fi
-
-"$WHISPER_BIN" "${WHISPER_ARGS[@]}" -of "$WORK_DIR/transcript"
-
-TRANSCRIPT_FILE="$WORK_DIR/transcript.txt"
-
-if [ ! -f "$TRANSCRIPT_FILE" ]; then
-  echo "[ERROR] Transcription failed."
-  exit 1
-fi
-
-WORD_COUNT=$(wc -w < "$TRANSCRIPT_FILE")
-echo "[OK] Transcription complete: ~${WORD_COUNT} words"
 
 # ============================================================
 # STEP 4: Generate knowledge base note
@@ -212,13 +317,26 @@ echo "=========================================="
 OUTPUT_FILE="$OUTPUT_DIR/${TIMESTAMP}_${SAFE_TITLE}.md"
 TRANSCRIPT_CONTENT=$(cat "$TRANSCRIPT_FILE")
 
-# format upload date
 FORMATTED_DATE=""
 if [ -n "$UPLOAD_DATE" ] && [ ${#UPLOAD_DATE} -eq 8 ]; then
   FORMATTED_DATE="${UPLOAD_DATE:0:4}-${UPLOAD_DATE:4:2}-${UPLOAD_DATE:6:2}"
 fi
 
 cat > "$OUTPUT_FILE" << MARKDOWN
+---
+platform: ${PLATFORM}
+source: ${VIDEO_URL}
+author: ${CHANNEL}
+created: $(date +%Y-%m-%d)
+upload_date: ${FORMATTED_DATE:-Unknown}
+duration: ${DURATION}
+language: ${LANG}
+transcript_source: ${SUBTITLE_SOURCE}
+note_type: video
+grade:
+tags: []
+---
+
 # ${TITLE}
 
 ## Metadata
@@ -226,10 +344,12 @@ cat > "$OUTPUT_FILE" << MARKDOWN
 | Field       | Value |
 |-------------|-------|
 | Source       | [Link](${VIDEO_URL}) |
+| Platform     | ${PLATFORM} |
 | Channel      | ${CHANNEL} |
 | Upload Date  | ${FORMATTED_DATE:-Unknown} |
 | Duration     | ${DURATION} |
 | Language     | ${LANG} |
+| Transcript   | ${SUBTITLE_SOURCE} |
 | Captured     | $(date +%Y-%m-%d) |
 
 ## Description
@@ -244,19 +364,23 @@ ${TRANSCRIPT_CONTENT}
 
 ---
 
-## Notes
+## Key Takeaways
 
-<!-- Add your own notes, key takeaways, and action items below -->
-
-### Key Takeaways
+<!-- Claude will fill this section when using /enrich -->
 
 -
 
-### Action Items
+## Action Items
 
 - [ ]
 
-### Related Topics
+## Related Topics
+
+-
+
+## Questions
+
+<!-- Questions for deeper understanding -->
 
 -
 MARKDOWN
@@ -270,16 +394,10 @@ if [ "$GEN_SRT" = true ] && [ -f "$WORK_DIR/transcript.srt" ]; then
   echo "[OK] SRT saved: $SRT_FILE"
 fi
 
-# optionally keep video/audio
 if [ "$KEEP_VIDEO" = true ]; then
   EXT="${VIDEO_FILE##*.}"
   cp "$VIDEO_FILE" "$OUTPUT_DIR/${TIMESTAMP}_${SAFE_TITLE}.${EXT}"
   echo "[OK] Video kept in output/"
-fi
-
-if [ "$KEEP_AUDIO" = true ]; then
-  cp "$AUDIO_WAV" "$OUTPUT_DIR/${TIMESTAMP}_${SAFE_TITLE}.wav"
-  echo "[OK] Audio kept in output/"
 fi
 
 echo ""
@@ -287,12 +405,9 @@ echo "=========================================="
 echo " DONE"
 echo "=========================================="
 echo ""
-echo "  Title:  $TITLE"
-echo "  Words:  ~$WORD_COUNT"
-echo "  Output: $OUTPUT_FILE"
+echo "  Title:      $TITLE"
+echo "  Transcript: $SUBTITLE_SOURCE"
+echo "  Output:     $OUTPUT_FILE"
 echo ""
-echo "  Next steps:"
-echo "    1. Review and edit the transcript"
-echo "    2. Add your own notes and key takeaways"
-echo "    3. Tag and file into your knowledge base"
+echo "  Next: run /enrich to add AI-generated summaries and key takeaways"
 echo ""
