@@ -1,0 +1,6 @@
+vendor/
+models/
+output/*.wav
+output/*.mp4
+output/*.webm
+output/*.mkv
