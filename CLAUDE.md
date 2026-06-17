@@ -38,6 +38,9 @@ bash scripts/batch.sh urls.txt -l zh                           # batch mode
 ## Commands
 
 - `/video2kb <url> [options]` - Process a video via Claude Code
+- `/video2skill <url> [options]` - Watch a video tutorial and generate a reusable Claude skill from it
+- `/enrich [file]` - Add AI-generated summaries and key takeaways to a note
+- `/kb <subcommand>` - Search, list, or manage the knowledge base
 
 ## Supported Languages
 
