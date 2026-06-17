@@ -77,7 +77,11 @@ done
 [ -n "$MODEL" ] && MODEL_PATH="$MODEL"
 
 # ---------- preflight checks ----------
-if ! command -v yt-dlp &>/dev/null; then
+if command -v yt-dlp &>/dev/null; then
+  YTDLP="yt-dlp"
+elif python3 -m yt_dlp --version &>/dev/null; then
+  YTDLP="python3 -m yt_dlp"
+else
   echo "[ERROR] yt-dlp not found. Run: ./scripts/setup.sh"
   exit 1
 fi
@@ -128,7 +132,7 @@ if [ "$SKIP_SUBS" = false ]; then
   SUB_LANG="$LANG"
   [ "$SUB_LANG" = "auto" ] && SUB_LANG="zh,en,ja,ko"
 
-  yt-dlp \
+  $YTDLP \
     --no-playlist \
     --skip-download \
     --write-subs \
@@ -150,8 +154,7 @@ if [ "$SKIP_SUBS" = false ]; then
     python3 -c "
 import re, sys
 
-with open('$SUB_FILE', 'r', encoding='utf-8', errors='ignore') as f:
-    content = f.read()
+content = sys.stdin.read()
 
 # Remove sequence numbers and timestamps
 lines = []
@@ -171,7 +174,7 @@ for line in content.split('\n'):
         lines.append(line)
 
 print('\n'.join(lines))
-" > "$WORK_DIR/transcript_raw.txt"
+" < "$SUB_FILE" > "$WORK_DIR/transcript_raw.txt"
 
     WORD_COUNT=$(wc -c < "$WORK_DIR/transcript_raw.txt")
     if [ "$WORD_COUNT" -gt 50 ]; then
@@ -193,7 +196,7 @@ echo "=========================================="
 echo " STEP 2/4  Downloading video..."
 echo "=========================================="
 
-yt-dlp \
+$YTDLP \
   --no-playlist \
   --write-info-json \
   --output "$WORK_DIR/video.%(ext)s" \
@@ -218,12 +221,12 @@ DURATION=""
 VIDEO_URL=""
 
 if [ -n "$INFO_JSON" ] && [ -f "$INFO_JSON" ]; then
-  TITLE=$(python3 -c "import json; d=json.load(open('$INFO_JSON')); print(d.get('title',''))" 2>/dev/null || true)
-  CHANNEL=$(python3 -c "import json; d=json.load(open('$INFO_JSON')); print(d.get('channel','') or d.get('uploader',''))" 2>/dev/null || true)
-  UPLOAD_DATE=$(python3 -c "import json; d=json.load(open('$INFO_JSON')); print(d.get('upload_date',''))" 2>/dev/null || true)
-  DESCRIPTION=$(python3 -c "import json; d=json.load(open('$INFO_JSON')); print(d.get('description','')[:500])" 2>/dev/null || true)
-  DURATION=$(python3 -c "import json; d=json.load(open('$INFO_JSON')); s=int(d.get('duration',0)); print(f'{s//3600}h{(s%3600)//60:02d}m{s%60:02d}s' if s>3600 else f'{s//60}m{s%60:02d}s')" 2>/dev/null || true)
-  VIDEO_URL=$(python3 -c "import json; d=json.load(open('$INFO_JSON')); print(d.get('webpage_url','') or d.get('original_url',''))" 2>/dev/null || true)
+  TITLE=$(python3 -c "import json,sys; d=json.load(sys.stdin); print(d.get('title',''))" < "$INFO_JSON" 2>/dev/null || true)
+  CHANNEL=$(python3 -c "import json,sys; d=json.load(sys.stdin); print(d.get('channel','') or d.get('uploader',''))" < "$INFO_JSON" 2>/dev/null || true)
+  UPLOAD_DATE=$(python3 -c "import json,sys; d=json.load(sys.stdin); print(d.get('upload_date',''))" < "$INFO_JSON" 2>/dev/null || true)
+  DESCRIPTION=$(python3 -c "import json,sys; d=json.load(sys.stdin); print(d.get('description','')[:500])" < "$INFO_JSON" 2>/dev/null || true)
+  DURATION=$(python3 -c "import json,sys; d=json.load(sys.stdin); s=int(d.get('duration',0)); print(f'{s//3600}h{(s%3600)//60:02d}m{s%60:02d}s' if s>3600 else f'{s//60}m{s%60:02d}s')" < "$INFO_JSON" 2>/dev/null || true)
+  VIDEO_URL=$(python3 -c "import json,sys; d=json.load(sys.stdin); print(d.get('webpage_url','') or d.get('original_url',''))" < "$INFO_JSON" 2>/dev/null || true)
 fi
 
 [ -z "$TITLE" ] && TITLE="Untitled Video"
